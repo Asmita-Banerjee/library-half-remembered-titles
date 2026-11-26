@@ -1,0 +1,8 @@
+# One-click deploy on Render (free plan): Dashboard -> New -> Blueprint -> this repo.
+services:
+  - type: web
+    name: library-half-remembered-titles
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health

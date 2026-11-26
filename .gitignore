@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+# Data (rebuilt from the bundled dataset on startup)
+backend/data/*.db
+*.db-journal
+# C build output
+engine/build/
+# Node
+frontend/node_modules/
+frontend/dist/
+# Env & editor
+.env
+.env.*
+!.env.example
+.DS_Store
+.vscode/
+.idea/
