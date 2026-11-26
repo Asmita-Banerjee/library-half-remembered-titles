@@ -198,8 +198,9 @@ BOOKS: list[Book] = [
             c("Robert Walton", "Arctic explorer who hears Victor's story"),
             c("Elizabeth Lavenza", "Victor's adopted sister and later wife"),
         ],
-        "plot": "Victor Frankenstein brings a creature to life and then rejects it. Lonely and spurned, "
-        "the creature takes revenge on Victor's family, and Victor pursues it into the Arctic.",
+        "plot": "Victor Frankenstein builds a creature from parts of dead bodies, brings it to life and then "
+        "rejects it. Lonely and spurned, the creature takes revenge on Victor's family, and Victor pursues it "
+        "into the Arctic.",
         "themes": ["creation", "ambition", "isolation", "responsibility", "science"],
         "settings": ["Geneva", "Ingolstadt", "Arctic", "Switzerland"],
         "note": "First edition (1818).",
@@ -219,7 +220,7 @@ BOOKS: list[Book] = [
         "plot": "Told through letters and diaries, the novel follows Count Dracula's move from Transylvania "
         "to England and the group led by Van Helsing who hunts him back to his castle.",
         "themes": ["vampires", "good versus evil", "fear", "modernity"],
-        "settings": ["Transylvania", "Whitby", "London", "castle"],
+        "settings": ["Transylvania", "Eastern Europe", "Whitby", "London", "castle"],
     },
     {
         "title": "Strange Case of Dr Jekyll and Mr Hyde",
@@ -999,3 +1000,17 @@ BOOKS: list[Book] = [
         "note": "Second catalogue copy of the first Pride and Prejudice record (duplicate title kept as its own record).",
     },
 ]
+
+
+# Intended readership, used as a search facet. Only books written for or
+# primarily published as children's books are marked; everything else is
+# "General". (Extended-catalogue records derive this from reader shelves.)
+CHILDREN = {
+    "Alice's Adventures in Wonderland", "Through the Looking-Glass", "The Wonderful Wizard of Oz",
+    "The Lion, the Witch and the Wardrobe", "The Hobbit", "Anne of Green Gables", "Treasure Island",
+    "Harry Potter and the Philosopher's Stone", "Harry Potter and the Chamber of Secrets",
+    "Harry Potter and the Prisoner of Azkaban",
+}
+for _b in BOOKS:
+    _b["audience"] = "Children" if _b["title"] in CHILDREN else "General"
+

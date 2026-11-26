@@ -1,115 +1,203 @@
-import { Search, TextSearch } from "lucide-react";
+import { SlidersHorizontal } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { useSearchParams } from "react-router-dom";
-import { Badge, Button, Card, EmptyState, ErrorNote, PageHeader, Timing } from "../components/ui";
+import { Link, useSearchParams } from "react-router-dom";
+import Cover from "../components/Cover";
+import FacetPanel, { EMPTY_FACETS, facetsActive } from "../components/FacetPanel";
+import Feedback from "../components/Feedback";
+import { Button, Empty, ErrorNote, IndexCard, Loading, PageHeader, RecordNo, Tag, Timing, cx } from "../components/ui";
 import { api } from "../lib/api";
-import type { StoryResult } from "../lib/types";
+import { useDebounced } from "../lib/hooks";
+import type { FacetValues, Reason, StoryHit, StoryResult } from "../lib/types";
 
-const EXAMPLES = [
-  "A detective who wears a hat and solves mysteries.",
+const TRY = [
+  "A detective who wears a hat and solves mysteries",
   "boy wizard at a school of magic",
-  "captain obsessed with a white whale",
-  "firemen burn books",
-  "time travel to the far future",
-  "orphan girl with red hair on a farm",
+  "a doctor who becomes an evil alter ego",
+  "sea captain obsessed with a white whale",
+  "vampyre romance",
+  "firemen who burn books",
 ];
+
+const KIND_NOTE: Record<Reason["kind"], string> = {
+  direct: "",
+  spelling: "close spelling of",
+  related: "related to",
+  wordnet: "synonym of",
+};
+
+function ResultCard({ b, rank }: { b: StoryHit; rank: number }) {
+  const [open, setOpen] = useState(false);
+  const seen = new Set<string>();
+  const reasons = b.reasons.filter((r) => { const k = `${r.term}|${r.field}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  return (
+    <IndexCard as="li" ruled className="flex gap-4 sm:gap-5">
+      <Link to={`/book/${b.id}`} className="shrink-0 pt-1" tabIndex={-1} aria-hidden>
+        <Cover isbn={b.cover_isbn} title={b.title} author={b.authors[0]} />
+      </Link>
+      <div className="min-w-0 flex-1">
+        <div className="flex min-h-[2.1rem] flex-wrap items-end justify-between gap-x-3">
+          <h3 className="text-[17px] font-bold leading-snug text-ink">
+            <span className="mr-1.5 font-normal text-ink-soft">{rank}.</span>
+            <Link to={`/book/${b.id}`} className="hover:text-stamp hover:underline">{b.title}</Link>
+          </h3>
+          <RecordNo id={b.id} />
+        </div>
+        <p className="mt-3.5 text-[14px] leading-[1.6rem] text-ink-soft">
+          {b.authors.join(" and ")}{b.year !== null && `, ${b.year < 0 ? `${-b.year} BC` : b.year}`}
+          {b.series && <> · <span className="italic">{b.series}</span></>}
+        </p>
+        <div className="flex flex-wrap gap-1.5 py-[3px]">
+          <Tag tone="stamp">{b.genre}</Tag>
+          {b.audience !== "General" && <Tag>{b.audience === "Children" ? "Children's" : "Young adult"}</Tag>}
+          {b.source === "goodbooks" && b.average_rating && <Tag title={`${b.ratings_count?.toLocaleString()} ratings on Goodreads`}>★ {b.average_rating.toFixed(2)}</Tag>}
+        </div>
+        {b.plot && <p className="text-[14.5px] leading-[1.6rem] text-ink">{b.plot}</p>}
+        {!b.plot && b.tags.length > 0 && (
+          <p className="text-[14px] leading-[1.6rem] text-ink-soft">Readers shelve it under {b.tags.slice(0, 6).map((t) => t.replace(/-s(-|$)/g, "'s$1").replace(/-/g, " ")).join(", ")}.</p>
+        )}
+        <div className="mt-1 text-[13.5px] leading-[1.6rem]">
+          <span className="text-ink-soft">Matched </span>
+          {reasons.slice(0, open ? undefined : 4).map((r, i) => (
+            <span key={i}>
+              {i > 0 && <span className="text-ink-soft">; </span>}
+              <span className="font-bold text-ink">"{r.term}"</span>
+              {r.related_to && r.kind !== "direct" && <span className="text-ink-soft"> ({KIND_NOTE[r.kind]} "{r.related_to}")</span>}
+              <span className="text-ink-soft"> in {r.field}</span>
+            </span>
+          ))}
+          {reasons.length > 4 && (
+            <button type="button" onClick={() => setOpen((o) => !o)} className="ml-1.5 text-stamp underline underline-offset-2">
+              {open ? "show fewer" : `+${reasons.length - 4} more`}
+            </button>
+          )}
+        </div>
+        {open && b.characters.length > 0 && (
+          <p className="text-[13.5px] leading-[1.6rem] text-ink-soft">
+            Characters: {b.characters.map((c) => c.name).join(", ")}
+          </p>
+        )}
+      </div>
+    </IndexCard>
+  );
+}
 
 export default function StoryPage() {
   const [params, setParams] = useSearchParams();
   const [q, setQ] = useState(params.get("q") ?? "");
+  const [facets, setFacets] = useState<FacetValues>(EMPTY_FACETS);
+  const [showFacets, setShowFacets] = useState(false);
   const [result, setResult] = useState<StoryResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const lastQuery = useRef<string>("");
+  const reqId = useRef(0);
 
-  async function run(text = q) {
+  async function run(text = q, f = facets) {
     setError(null);
-    if (!text.trim()) { setError("Describe a character, plot, setting or theme."); setResult(null); return; }
+    if (!text.trim()) { setError("Describe a character, a scene, the setting or what the book was about."); setResult(null); return; }
+    const id = ++reqId.current;
+    lastQuery.current = text;
     setBusy(true);
-    try { setResult(await api.story(text)); } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+    try {
+      const r = await api.story(text, f);
+      if (id === reqId.current) setResult(r);
+    } catch (e) {
+      if (id === reqId.current) setError((e as Error).message);
+    } finally {
+      if (id === reqId.current) setBusy(false);
+    }
   }
+
   const ran = useRef(false);
   useEffect(() => {
-    if (ran.current || params.get("run") !== "1") return;
+    if (ran.current) return;
     ran.current = true;
-    run();
-    params.delete("run"); setParams(params, { replace: true });
+    if (params.get("run") === "1" && q.trim()) {
+      run();
+      params.delete("run");
+      setParams(params, { replace: true });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Changing a filter re-runs the last search.
+  const debouncedFacets = useDebounced(JSON.stringify(facets), 350);
+  const firstFacetRun = useRef(true);
+  useEffect(() => {
+    if (firstFacetRun.current) { firstFacetRun.current = false; return; }
+    if (lastQuery.current.trim()) run(lastQuery.current, JSON.parse(debouncedFacets) as FacetValues);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedFacets]);
+
   const submit = (e: FormEvent) => { e.preventDefault(); run(); };
+  const expansions = result?.expansions ?? [];
 
   return (
     <div>
-      <PageHeader icon={<TextSearch className="h-6 w-6" />} title="Characters & story"
-        subtitle="Describe what you remember in your own words: who was in it, what happened, where it was set, or what it was about." />
-      <Card className="mb-6">
+      <PageHeader title="Describe the story">
+        Tell us who was in it, what happened, where it was set or what it was about. Your own words are fine.
+      </PageHeader>
+
+      <IndexCard ruled punched className="mb-8">
         <form onSubmit={submit}>
-          <label htmlFor="story-q" className="mb-1.5 block text-[13px] font-medium text-ink">What do you remember?</label>
+          <div className="flex min-h-[2.1rem] items-end justify-between">
+            <label htmlFor="story-q" className="text-[15px] text-ink">What do you remember?</label>
+            <span className="typewriter text-[12.5px] text-ink-soft">{q.length}/500</span>
+          </div>
           <textarea id="story-q" rows={3} maxLength={500} value={q} onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); run(); } }}
-            placeholder="e.g. A detective who wears a hat and solves mysteries."
-            className="w-full resize-y rounded-lg border border-line bg-white px-3 py-2 text-[15px] placeholder:text-stone-400 focus:border-navy focus:outline-none focus:ring-2 focus:ring-navy/15" />
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <Button type="submit" loading={busy}><Search className="h-4 w-4" /> Find books</Button>
-            <span className="ml-1 text-xs text-muted">Try:</span>
-            {EXAMPLES.map((ex) => (
+            placeholder="A detective who wears a hat and solves mysteries"
+            className="typewriter mt-[3px] w-full resize-y bg-transparent text-[15px] leading-[1.6rem] text-ink placeholder:text-ink-soft/55 focus:outline-none" />
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <Button type="submit" loading={busy}>Find the book</Button>
+            <button type="button" aria-expanded={showFacets} onClick={() => setShowFacets((s) => !s)}
+              className={cx("inline-flex items-center gap-1.5 text-[14px] underline-offset-4 hover:underline", facetsActive(facets) ? "text-stamp" : "text-ink-soft")}>
+              <SlidersHorizontal className="h-4 w-4" aria-hidden /> Narrow it down{facetsActive(facets) && " (on)"}
+            </button>
+            {facetsActive(facets) && <button type="button" className="text-[13.5px] text-ink-soft underline underline-offset-4" onClick={() => setFacets(EMPTY_FACETS)}>Clear filters</button>}
+          </div>
+          {showFacets && <div className="mt-4 rounded-[3px] bg-manila-light/70 p-3"><FacetPanel idPrefix="story" value={facets} onChange={setFacets} /></div>}
+          <div className="mt-4 flex flex-wrap items-center gap-2 pb-2">
+            <span className="text-[13px] text-ink-soft">Try:</span>
+            {TRY.map((ex) => (
               <button key={ex} type="button" onClick={() => { setQ(ex); run(ex); }}
-                className="rounded-full border border-line bg-white px-2.5 py-1 text-xs text-muted hover:border-navy/40 hover:text-navy">{ex}</button>
+                className="rounded-[3px] border border-ink/20 px-2 py-0.5 text-[13px] text-ink-soft hover:border-stamp hover:text-stamp">
+                {ex}
+              </button>
             ))}
           </div>
         </form>
         {error && <div className="mt-3"><ErrorNote>{error}</ErrorNote></div>}
-      </Card>
+      </IndexCard>
+
+      {busy && !result && <p className="text-sage">Searching the drawers…</p>}
 
       {result && result.results.length === 0 && (
-        <EmptyState icon={<TextSearch className="h-8 w-8" />} title="No books match that description">
-          None of the words {result.terms.length ? <>({result.terms.map((t) => `“${t}”`).join(", ")})</> : null} appear in the catalog's character, plot, setting or theme data.
-        </EmptyState>
+        <Empty title="No book in the catalogue matches that description">
+          {result.facets_applied ? "Your filters may be too narrow. Clear them and search again." :
+            "Try other words for the same thing, a character's name, or where it was set."}
+        </Empty>
       )}
+
       {result && result.results.length > 0 && (
         <>
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-sm text-muted">
-            <span>Ranked {result.results.length} book{result.results.length === 1 ? "" : "s"} for: {result.terms.map((t) => <Badge key={t} tone="navy">{t}</Badge>)}</span>
-            <Timing ms={result.elapsed_ms} />
+          <div className="mb-4 flex flex-wrap items-baseline justify-between gap-3 text-[14px] text-sage">
+            <p>
+              {result.results.length} best match{result.results.length === 1 ? "" : "es"}
+              {result.facets_applied && " within your filters"}
+              {expansions.length > 0 && (
+                <> · also searched for {expansions.slice(0, 4).map((x, i) => (
+                  <span key={i}>{i > 0 && ", "}<span className="text-chalk">{x.to}</span> ({x.kind === "spelling" ? "spelling of" : "for"} "{x.from}")</span>
+                ))}</>
+              )}
+            </p>
+            <span className="flex items-center gap-3">{busy && <Loading label="Updating" />}<Timing ms={result.elapsed_ms} /></span>
           </div>
-          <ol className="space-y-4">
-            {result.results.map((b, i) => (
-              <Card as="li" key={b.id}>
-                <div className="flex flex-wrap items-baseline justify-between gap-2">
-                  <h3 className="font-serif text-lg font-semibold text-ink"><span className="mr-2 text-muted">{i + 1}.</span>{b.title}</h3>
-                  <div className="flex items-center gap-2"><Badge>{b.genre}</Badge><span className="font-mono text-xs text-muted">#{b.id}</span></div>
-                </div>
-                <p className="text-sm text-muted">{b.authors.join(", ")} · {b.year} · relevance {b.score.toFixed(2)}</p>
-                <p className="mt-3 text-sm leading-relaxed text-ink">{b.plot}</p>
-                <div className="mt-3 grid gap-3 md:grid-cols-2">
-                  <div>
-                    <p className="mb-1 text-xs font-medium uppercase tracking-wide text-muted">Characters</p>
-                    <ul className="space-y-0.5 text-sm">
-                      {b.characters.slice(0, 4).map((c) => <li key={c.name}><span className="font-medium text-ink">{c.name}</span> <span className="text-muted">— {c.description}</span></li>)}
-                    </ul>
-                  </div>
-                  <div>
-                    <p className="mb-1 text-xs font-medium uppercase tracking-wide text-muted">Why it matched</p>
-                    <ul className="space-y-1 text-sm">
-                      {b.reasons.map((r, j) => (
-                        <li key={j} className="text-ink">
-                          <span className="font-medium">“{r.term}”</span>
-                          {r.related_to && <span className="text-muted"> (related to “{r.related_to}”)</span>}
-                          <span className="text-muted"> in {r.field}</span>
-                          {r.context && <span className="block truncate text-xs text-muted">{r.context}</span>}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
-                <div className="mt-3 flex flex-wrap gap-1.5">
-                  {b.settings.slice(0, 3).map((s) => <Badge key={s}>{s}</Badge>)}
-                  {b.themes.slice(0, 3).map((t) => <Badge key={t} tone="navy">{t}</Badge>)}
-                </div>
-              </Card>
-            ))}
+          <ol className={cx("space-y-4", busy && "opacity-70")}>
+            {result.results.map((b, i) => <ResultCard key={b.id} b={b} rank={i + 1} />)}
           </ol>
-          <p className="mt-4 text-xs text-muted">{result.algorithm}. Keyword-based; related terms are shown as such and score lower than direct matches.</p>
+          <div className="mt-6"><Feedback key={result.search_id ?? "none"} onDark searchType="story" searchId={result.search_id} /></div>
         </>
       )}
     </div>

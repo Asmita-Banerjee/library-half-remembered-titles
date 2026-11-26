@@ -41,7 +41,8 @@ static void vec_free(IntVec *a) {
 /* ------------------------------------------------------------------ */
 /* Trie: left-child / right-sibling nodes in a growable pool.          */
 /* Alphabet is small (a-z 0-9 space ' - |), so a sibling scan is O(1)  */
-/* per character while each node costs only ~16 bytes (+ id list).     */
+/* per character. A node is 16 bytes; id lists live in a parallel      */
+/* array that only the prefix/suffix tries allocate.                    */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -49,11 +50,11 @@ typedef struct {
     int sib;            /* next sibling index or -1                     */
     int latest;         /* prefix-suffix trie: latest id, else -1       */
     unsigned char ch;
-    IntVec ids;         /* prefix/suffix tries: ascending ids in subtree */
 } Node;
 
 typedef struct {
     Node *n;
+    IntVec *ids;        /* NULL unless keep_ids: ascending ids in subtree */
     int len, cap;
     int keep_ids;
 } Trie;
@@ -64,6 +65,11 @@ static int trie_new_node(Trie *t, unsigned char ch) {
         Node *nn = (Node *)realloc(t->n, (size_t)nc * sizeof(Node));
         if (!nn) return -1;
         t->n = nn;
+        if (t->keep_ids) {
+            IntVec *ni = (IntVec *)realloc(t->ids, (size_t)nc * sizeof(IntVec));
+            if (!ni) return -1;
+            t->ids = ni;
+        }
         t->cap = nc;
     }
     Node *x = &t->n[t->len];
@@ -71,22 +77,28 @@ static int trie_new_node(Trie *t, unsigned char ch) {
     x->sib = -1;
     x->latest = -1;
     x->ch = ch;
-    x->ids.v = NULL;
-    x->ids.len = x->ids.cap = 0;
+    if (t->keep_ids) {
+        t->ids[t->len].v = NULL;
+        t->ids[t->len].len = t->ids[t->len].cap = 0;
+    }
     return t->len++;
 }
 
 static int trie_init(Trie *t, int keep_ids) {
     t->n = NULL;
+    t->ids = NULL;
     t->len = t->cap = 0;
     t->keep_ids = keep_ids;
     return trie_new_node(t, 0) == 0 ? 0 : -1; /* root = 0 */
 }
 
 static void trie_free(Trie *t) {
-    for (int i = 0; i < t->len; i++) vec_free(&t->n[i].ids);
+    if (t->ids)
+        for (int i = 0; i < t->len; i++) vec_free(&t->ids[i]);
+    free(t->ids);
     free(t->n);
     t->n = NULL;
+    t->ids = NULL;
     t->len = t->cap = 0;
 }
 
@@ -203,6 +215,8 @@ struct TSIndex {
     int *lens;
     int n, cap;
     int built;
+    int max_affix;      /* 0 = index every prefix/suffix in the ps-trie */
+    int last_path;      /* 0 = ps-trie, 1 = affix-trie intersection fallback */
 
     Trie ps;            /* "<suffix>|<word>" -> latest id   */
     Trie pre;           /* title             -> id lists    */
@@ -213,6 +227,38 @@ struct TSIndex {
     long build_count, query_count;
 };
 
+/* Latin-1 Supplement + Latin Extended-A (U+00C0..U+017F) folded to ASCII.
+ * Entries are 1-2 ASCII chars; "" = drop. Index = codepoint - 0xC0. */
+static const char *const FOLD[192] = {
+    "a","a","a","a","a","a","ae","c","e","e","e","e","i","i","i","i",        /* C0-CF */
+    "d","n","o","o","o","o","o","", "o","u","u","u","u","y","th","ss",       /* D0-DF */
+    "a","a","a","a","a","a","ae","c","e","e","e","e","i","i","i","i",        /* E0-EF */
+    "d","n","o","o","o","o","o","", "o","u","u","u","u","y","th","y",        /* F0-FF */
+    "a","a","a","a","a","a","c","c","c","c","c","c","c","c","d","d",         /* 100-10F */
+    "d","d","e","e","e","e","e","e","e","e","e","e","g","g","g","g",         /* 110-11F */
+    "g","g","g","g","h","h","h","h","i","i","i","i","i","i","i","i",         /* 120-12F */
+    "i","i","ij","ij","j","j","k","k","k","l","l","l","l","l","l","l",       /* 130-13F */
+    "l","l","l","n","n","n","n","n","n","n","n","n","o","o","o","o",         /* 140-14F */
+    "o","o","oe","oe","r","r","r","r","r","r","s","s","s","s","s","s",       /* 150-15F */
+    "s","s","t","t","t","t","t","t","u","u","u","u","u","u","u","u",         /* 160-16F */
+    "u","u","u","u","w","w","y","y","y","z","z","z","z","z","z","s",         /* 170-17F */
+};
+
+/* Decode one UTF-8 sequence; returns codepoint and advances *p (invalid -> 0xFFFD). */
+static unsigned decode_utf8(const unsigned char **p) {
+    const unsigned char *s = *p;
+    unsigned c = s[0];
+    int n = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+    if (n == 0) { *p = s + 1; return 0xFFFD; }
+    unsigned cp = n == 1 ? c : n == 2 ? (c & 0x1F) : n == 3 ? (c & 0x0F) : (c & 0x07);
+    for (int i = 1; i < n; i++) {
+        if ((s[i] & 0xC0) != 0x80) { *p = s + i; return 0xFFFD; }
+        cp = (cp << 6) | (s[i] & 0x3F);
+    }
+    *p = s + n;
+    return cp;
+}
+
 int ts_normalize(const char *in, char *out, int cap) {
     int o = 0, pending_space = 0;
     if (!out || cap <= 0) return 0;
@@ -220,27 +266,50 @@ int ts_normalize(const char *in, char *out, int cap) {
         out[0] = '\0';
         return 0;
     }
-    for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
-        unsigned char c = *p;
-        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
-        int keep = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '\'' || c == '-';
-        int space = (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' || c == '.' ||
-                     c == ':' || c == ';' || c == '!' || c == '?' || c == '"' || c == '(' ||
-                     c == ')' || c == '&' || c == '/');
-        if (keep) {
+    const unsigned char *p = (const unsigned char *)in;
+    while (*p) {
+        unsigned cp = decode_utf8(&p);
+        char buf[3] = {0, 0, 0};
+        const char *emit = NULL;     /* ASCII text to keep */
+        int space = 0;
+        if (cp < 0x80) {
+            unsigned char c = (unsigned char)cp;
+            if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '\'' || c == '-') {
+                buf[0] = (char)c;
+                emit = buf;
+            } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' || c == '.' || c == ':' ||
+                       c == ';' || c == '!' || c == '?' || c == '"' || c == '(' || c == ')' || c == '&' ||
+                       c == '/') {
+                space = 1;
+            } /* other ASCII (including the separator '|') is dropped */
+        } else if (cp >= 0xC0 && cp <= 0x17F) {
+            emit = FOLD[cp - 0xC0];
+        } else if (cp == 0x2018 || cp == 0x2019 || cp == 0x02BC) {
+            emit = "'";                     /* curly apostrophes */
+        } else if (cp == 0x2010 || cp == 0x2011) {
+            emit = "-";                     /* typographic hyphens */
+        } else if (cp == 0x00A0 || cp == 0x2013 || cp == 0x2014 || cp == 0x201C || cp == 0x201D ||
+                   cp == 0x2026 || (cp >= 0x2000 && cp <= 0x200A)) {
+            space = 1;                      /* dashes, curly quotes, ellipsis, spaces */
+        } /* everything else (other scripts, symbols) is dropped */
+        if (space) {
+            pending_space = 1;
+        } else if (emit && *emit) {
             if (pending_space && o > 0 && o < cap - 1) out[o++] = ' ';
             pending_space = 0;
-            if (o < cap - 1) out[o++] = (char)c;
-        } else if (space) {
-            pending_space = 1;
-        } /* anything else (non-ASCII, '|', ...) is dropped */
+            for (const char *e = emit; *e && o < cap - 1; e++) out[o++] = *e;
+        }
     }
     out[o] = '\0';
     return o;
 }
 
-TSIndex *ts_create(void) {
+TSIndex *ts_create(void) { return ts_create_ex(0); }
+
+TSIndex *ts_create_ex(int max_affix) {
     TSIndex *idx = (TSIndex *)calloc(1, sizeof(TSIndex));
+    if (idx) idx->max_affix = max_affix > 0 ? max_affix : 0;
     return idx;
 }
 
@@ -262,8 +331,7 @@ int ts_add(TSIndex *idx, const char *title) {
     if (!idx || !title) return TS_INVALID;
     if (idx->built) return TS_BUILT;
     char buf[TS_MAX_TITLE];
-    int len = ts_normalize(title, buf, TS_MAX_TITLE);
-    if (len == 0) return TS_INVALID;
+    int len = ts_normalize(title, buf, TS_MAX_TITLE); /* 0 = kept, but nothing to index */
     if (idx->n == idx->cap) {
         int nc = idx->cap ? idx->cap * 2 : 64;
         char **nt = (char **)realloc(idx->titles, (size_t)nc * sizeof(char *));
@@ -299,11 +367,12 @@ int ts_build(TSIndex *idx) {
          *    key "s|p" of one (prefix, suffix) combination: L keys cover all
          *    L*L combinations. Ids arrive in increasing order, so writing the
          *    id at every combination node leaves the latest match there. */
-        for (int i = 0; i < L; i++) {
+        int A = idx->max_affix ? (L < idx->max_affix ? L : idx->max_affix) : L;
+        for (int i = L - A; i < L; i++) {          /* suffixes of length <= A */
             int node = 0;
             for (int j = i; j < L; j++) node = trie_find_or_add(&idx->ps, node, (unsigned char)w[j]);
             node = trie_find_or_add(&idx->ps, node, (unsigned char)TS_SEPARATOR);
-            for (int j = 0; j < L; j++) {
+            for (int j = 0; j < A; j++) {              /* prefixes of length <= A */
                 node = trie_find_or_add(&idx->ps, node, (unsigned char)w[j]);
                 if (node < 0) return TS_INVALID;
                 idx->ps.n[node].latest = id;
@@ -317,14 +386,14 @@ int ts_build(TSIndex *idx) {
         for (int j = 0; j < L; j++) {
             node = trie_find_or_add(&idx->pre, node, (unsigned char)w[j]);
             if (node < 0) return TS_INVALID;
-            vec_push(&idx->pre.n[node].ids, id);
+            vec_push(&idx->pre.ids[node], id);
         }
         /* 3. Suffix trie over the reversed title. */
         node = 0;
         for (int j = L - 1; j >= 0; j--) {
             node = trie_find_or_add(&idx->suf, node, (unsigned char)w[j]);
             if (node < 0) return TS_INVALID;
-            vec_push(&idx->suf.n[node].ids, id);
+            vec_push(&idx->suf.ids[node], id);
         }
         /* 4. 1/2/3-gram postings, one entry per (gram, title). */
         for (int g = 1; g <= 3; g++) {
@@ -357,11 +426,32 @@ int ts_query(TSIndex *idx, const char *prefix, const char *suffix) {
     int sl = ts_normalize(suffix, s, TS_MAX_TITLE);
     if (pl == 0 || sl == 0) return TS_INVALID;
     idx->query_count++;
+    if (idx->max_affix && (pl > idx->max_affix || sl > idx->max_affix)) {
+        /* Clue longer than the ps-trie depth: intersect the prefix-trie and
+         * suffix-trie id lists from the newest end. Still indexed (no title
+         * is scanned): O(|p| + |s| + |A| + |B|). */
+        idx->last_path = 1;
+        char r[TS_MAX_TITLE];
+        for (int i = 0; i < sl; i++) r[i] = s[sl - 1 - i];
+        int a = trie_walk(&idx->pre, p, pl), b = trie_walk(&idx->suf, r, sl);
+        if (a == -1 || b == -1) return TS_NO_MATCH;
+        const IntVec *A = &idx->pre.ids[a], *B = &idx->suf.ids[b];
+        int i = A->len - 1, j = B->len - 1;
+        while (i >= 0 && j >= 0) {
+            if (A->v[i] == B->v[j]) return A->v[i];
+            if (A->v[i] > B->v[j]) i--; else j--;
+        }
+        return TS_NO_MATCH;
+    }
+    idx->last_path = 0;
     int node = trie_walk(&idx->ps, s, sl);
     if (node != -1) node = trie_find(&idx->ps, node, (unsigned char)TS_SEPARATOR);
     for (int i = 0; i < pl && node != -1; i++) node = trie_find(&idx->ps, node, (unsigned char)p[i]);
     return node == -1 ? TS_NO_MATCH : idx->ps.n[node].latest;
 }
+
+int ts_last_path(const TSIndex *idx) { return idx ? idx->last_path : 0; }
+int ts_max_affix(const TSIndex *idx) { return idx ? idx->max_affix : 0; }
 
 static int starts_with(const char *t, int tl, const char *p, int pl) {
     return pl <= tl && memcmp(t, p, (size_t)pl) == 0;
@@ -439,16 +529,16 @@ int ts_multi(TSIndex *idx, const char *prefix, const char *const *contains, int 
     if (k.pl > 0) {
         int node = trie_walk(&idx->pre, k.p, k.pl);
         if (node == -1) return 0;
-        lists[nl].v = idx->pre.n[node].ids.v;
-        lists[nl++].len = idx->pre.n[node].ids.len;
+        lists[nl].v = idx->pre.ids[node].v;
+        lists[nl++].len = idx->pre.ids[node].len;
     }
     if (k.sl > 0) {
         char r[TS_MAX_TITLE];
         for (int i = 0; i < k.sl; i++) r[i] = k.s[k.sl - 1 - i];
         int node = trie_walk(&idx->suf, r, k.sl);
         if (node == -1) return 0;
-        lists[nl].v = idx->suf.n[node].ids.v;
-        lists[nl++].len = idx->suf.n[node].ids.len;
+        lists[nl].v = idx->suf.ids[node].v;
+        lists[nl++].len = idx->suf.ids[node].len;
     }
     for (int c = 0; c < k.nc; c++) {
         int l = k.cl[c];
@@ -535,7 +625,7 @@ int ts_prefix_ids(const TSIndex *idx, const char *prefix, int *out, int cap) {
     int pl = ts_normalize(prefix, p, TS_MAX_TITLE);
     if (pl == 0) return TS_INVALID;
     int node = trie_walk(&idx->pre, p, pl);
-    return node == -1 ? 0 : copy_desc(&idx->pre.n[node].ids, out, cap);
+    return node == -1 ? 0 : copy_desc(&idx->pre.ids[node], out, cap);
 }
 
 int ts_suffix_ids(const TSIndex *idx, const char *suffix, int *out, int cap) {
@@ -545,7 +635,7 @@ int ts_suffix_ids(const TSIndex *idx, const char *suffix, int *out, int cap) {
     if (sl == 0) return TS_INVALID;
     for (int i = 0; i < sl; i++) r[i] = s[sl - 1 - i];
     int node = trie_walk(&idx->suf, r, sl);
-    return node == -1 ? 0 : copy_desc(&idx->suf.n[node].ids, out, cap);
+    return node == -1 ? 0 : copy_desc(&idx->suf.ids[node], out, cap);
 }
 
 int ts_longest_prefix(const TSIndex *idx, const char *prefix) {
@@ -605,7 +695,7 @@ static void fuzzy_dfs(FuzzCtx *f, int node, int depth, const int *prev) {
             Fuzzy *r = &f->res[f->nres++];
             memcpy(r->text, f->path, (size_t)depth + 1);
             r->text[depth + 1] = '\0';
-            r->count = f->t->n[c].ids.len;
+            r->count = f->t->ids[c].len;
             r->dist = d;
         }
         if (best <= f->maxd && depth + 1 < f->cl + f->maxd && depth + 1 < TS_MAX_TITLE - 1)
@@ -700,6 +790,124 @@ double ts_bench_multi(TSIndex *idx, const char *const *prefixes, const char *con
     return now_ns() - t0;
 }
 
+/* Hash-map baseline: every (prefix, suffix) pair of every title stored as
+ * the string key "p|s" -> latest id (the classic O(N L^3) alternative).
+ * Built on demand for the benchmark, then freed. */
+typedef struct {
+    uint64_t *hash;
+    int *off;           /* offset of key in arena, -1 = empty */
+    int *val;
+    int cap, len;
+    char *arena;
+    long alen, acap;
+} PairMap;
+
+static uint64_t fnv1a(const char *s, int n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int i = 0; i < n; i++) h = (h ^ (unsigned char)s[i]) * 1099511628211ULL;
+    return h;
+}
+
+static int pm_init(PairMap *m, int cap) {
+    memset(m, 0, sizeof *m);
+    m->cap = cap;
+    m->hash = (uint64_t *)malloc((size_t)cap * sizeof(uint64_t));
+    m->off = (int *)malloc((size_t)cap * sizeof(int));
+    m->val = (int *)malloc((size_t)cap * sizeof(int));
+    if (!m->hash || !m->off || !m->val) return -1;
+    for (int i = 0; i < cap; i++) m->off[i] = -1;
+    return 0;
+}
+
+static void pm_free(PairMap *m) {
+    free(m->hash); free(m->off); free(m->val); free(m->arena);
+    memset(m, 0, sizeof *m);
+}
+
+static int pm_slot(const PairMap *m, const char *k, int kl, uint64_t h) {
+    int mask = m->cap - 1, i = (int)(h & (uint64_t)mask);
+    while (m->off[i] != -1) {
+        if (m->hash[i] == h && memcmp(m->arena + m->off[i], k, (size_t)kl) == 0 && m->arena[m->off[i] + kl] == 0)
+            return i;
+        i = (i + 1) & mask;
+    }
+    return i;
+}
+
+static int pm_put(PairMap *m, const char *k, int kl, int val) {
+    if ((m->len + 1) * 10 >= m->cap * 7) {
+        PairMap g;
+        if (pm_init(&g, m->cap * 2)) return -1;
+        g.arena = m->arena; g.alen = m->alen; g.acap = m->acap;
+        for (int i = 0; i < m->cap; i++) {
+            if (m->off[i] == -1) continue;
+            int mask = g.cap - 1, j = (int)(m->hash[i] & (uint64_t)mask);
+            while (g.off[j] != -1) j = (j + 1) & mask;
+            g.hash[j] = m->hash[i]; g.off[j] = m->off[i]; g.val[j] = m->val[i];
+            g.len++;
+        }
+        free(m->hash); free(m->off); free(m->val);
+        *m = g;
+    }
+    uint64_t h = fnv1a(k, kl);
+    int s = pm_slot(m, k, kl, h);
+    if (m->off[s] == -1) {
+        if (m->alen + kl + 1 > m->acap) {
+            long nc = m->acap ? m->acap * 2 : 1 << 16;
+            while (nc < m->alen + kl + 1) nc *= 2;
+            char *na = (char *)realloc(m->arena, (size_t)nc);
+            if (!na) return -1;
+            m->arena = na; m->acap = nc;
+        }
+        memcpy(m->arena + m->alen, k, (size_t)kl);
+        m->arena[m->alen + kl] = 0;
+        m->off[s] = (int)m->alen; m->hash[s] = h;
+        m->alen += kl + 1;
+        m->len++;
+    }
+    m->val[s] = val;     /* ids ascend: last write = latest */
+    return 0;
+}
+
+double ts_bench_hash(TSIndex *idx, const char *const *prefixes, const char *const *suffixes, int n, int *out,
+                     double *build_ns, long *bytes) {
+    if (!idx || !idx->built || idx->max_affix) return -1.0;   /* full pair set only */
+    PairMap m;
+    if (pm_init(&m, 1024)) return -1.0;
+    double t0 = now_ns();
+    char key[2 * TS_MAX_TITLE + 2];
+    for (int id = 0; id < idx->n; id++) {
+        const char *w = idx->titles[id];
+        int L = idx->lens[id];
+        for (int a = 1; a <= L; a++)
+            for (int b = 1; b <= L; b++) {
+                memcpy(key, w, (size_t)a);
+                key[a] = TS_SEPARATOR;
+                memcpy(key + a + 1, w + L - b, (size_t)b);
+                if (pm_put(&m, key, a + 1 + b, id)) { pm_free(&m); return -1.0; }
+            }
+    }
+    double t1 = now_ns();
+    if (build_ns) *build_ns = t1 - t0;
+    if (bytes) *bytes = (long)m.cap * (long)(sizeof(uint64_t) + 2 * sizeof(int)) + m.acap;
+    double q0 = now_ns();
+    for (int i = 0; i < n; i++) {
+        char p[TS_MAX_TITLE], s[TS_MAX_TITLE];
+        int pl = ts_normalize(prefixes[i], p, TS_MAX_TITLE), sl = ts_normalize(suffixes[i], s, TS_MAX_TITLE);
+        int r = TS_INVALID;
+        if (pl && sl) {
+            memcpy(key, p, (size_t)pl); key[pl] = TS_SEPARATOR; memcpy(key + pl + 1, s, (size_t)sl);
+            int kl = pl + 1 + sl;
+            int slot = pm_slot(&m, key, kl, fnv1a(key, kl));
+            r = m.off[slot] == -1 ? TS_NO_MATCH : m.val[slot];
+        }
+        if (out) out[i] = r;
+    }
+    double el = now_ns() - q0;
+    pm_free(&m);
+    return el;
+}
+
 /* ------------------------------------------------------------------ */
 /* Statistics                                                          */
 /* ------------------------------------------------------------------ */
@@ -719,10 +927,10 @@ long ts_aux_nodes(const TSIndex *idx) {
 long ts_ngram_keys(const TSIndex *idx) { return idx && idx->built ? idx->grams.len : 0; }
 long ts_memory_bytes(const TSIndex *idx) {
     if (!idx || !idx->built) return 0;
-    long b = (long)idx->ps.cap * (long)sizeof(Node) + (long)idx->pre.cap * (long)sizeof(Node) +
-             (long)idx->suf.cap * (long)sizeof(Node);
-    for (int i = 0; i < idx->pre.len; i++) b += (long)idx->pre.n[i].ids.cap * (long)sizeof(int);
-    for (int i = 0; i < idx->suf.len; i++) b += (long)idx->suf.n[i].ids.cap * (long)sizeof(int);
+    long b = (long)idx->ps.cap * (long)sizeof(Node) + (long)idx->pre.cap * (long)(sizeof(Node) + sizeof(IntVec)) +
+             (long)idx->suf.cap * (long)(sizeof(Node) + sizeof(IntVec));
+    for (int i = 0; i < idx->pre.len; i++) b += (long)idx->pre.ids[i].cap * (long)sizeof(int);
+    for (int i = 0; i < idx->suf.len; i++) b += (long)idx->suf.ids[i].cap * (long)sizeof(int);
     b += (long)idx->grams.cap * (long)(sizeof(uint32_t) + sizeof(IntVec));
     for (int i = 0; i < idx->grams.cap; i++) b += (long)idx->grams.vals[i].cap * (long)sizeof(int);
     return b;

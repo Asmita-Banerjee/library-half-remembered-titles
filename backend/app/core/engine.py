@@ -36,6 +36,11 @@ def _load() -> ctypes.CDLL:
     SA = ctypes.POINTER(ctypes.c_char_p)
     sigs = {
         "ts_create": ([], P),
+        "ts_create_ex": ([I], P),
+        "ts_last_path": ([P], I),
+        "ts_max_affix": ([P], I),
+        "ts_bench_hash": ([P, SA, SA, I, IP, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_long)],
+                          ctypes.c_double),
         "ts_destroy": ([P], None),
         "ts_add": ([P, S], I),
         "ts_build": ([P], I),
@@ -103,11 +108,11 @@ class FuzzyVariant:
 class TitleEngine:
     """One fixed catalog of titles + its C indexes."""
 
-    def __init__(self, name: str, titles: list[str]):
+    def __init__(self, name: str, titles: list[str], max_affix: int = 0):
         self.name = name
         self.lock = threading.Lock()  # the C index is single-threaded
         self._lib = lib()
-        self._idx = self._lib.ts_create()
+        self._idx = self._lib.ts_create_ex(max_affix)
         for i, t in enumerate(titles):
             rid = self._lib.ts_add(self._idx, _b(t))
             if rid != i:
@@ -129,6 +134,14 @@ class TitleEngine:
     # -- exact ---------------------------------------------------------
     def query(self, prefix: str, suffix: str) -> int:
         return self._lib.ts_query(self._idx, _b(prefix), _b(suffix))
+
+    def last_path(self) -> str:
+        """Which structure answered the last query()."""
+        return "affix-intersection" if self._lib.ts_last_path(self._idx) == 1 else "prefix-suffix-trie"
+
+    @property
+    def max_affix(self) -> int:
+        return self._lib.ts_max_affix(self._idx)
 
     def query_linear(self, prefix: str, suffix: str) -> int:
         return self._lib.ts_query_linear(self._idx, _b(prefix), _b(suffix))
@@ -198,6 +211,19 @@ class TitleEngine:
         ns = self._lib.ts_bench_multi(self._idx, P, C, S, n, int(linear), out)
         return ns, list(out[:n])
 
+    def bench_hash(self, pairs: list[tuple[str, str]]) -> dict | None:
+        """Hash-map-of-all-pairs baseline; None when the index has an affix cap."""
+        n = len(pairs)
+        P = (ctypes.c_char_p * max(1, n))(*[_b(p) for p, _ in pairs])
+        S = (ctypes.c_char_p * max(1, n))(*[_b(s) for _, s in pairs])
+        out = (ctypes.c_int * max(1, n))()
+        build = ctypes.c_double(0)
+        nbytes = ctypes.c_long(0)
+        ns = self._lib.ts_bench_hash(self._idx, P, S, n, out, ctypes.byref(build), ctypes.byref(nbytes))
+        if ns < 0:
+            return None
+        return {"query_ns": ns, "build_ns": build.value, "bytes": nbytes.value, "out": list(out[:n])}
+
     def title(self, rid: int) -> str:
         v = self._lib.ts_title(self._idx, rid)
         return v.decode("ascii") if v else ""
@@ -209,6 +235,7 @@ class TitleEngine:
         return {
             "name": self.name,
             "records": self.size,
+            "max_affix": L.ts_max_affix(i),
             "build_ms": round(self.build_ms, 4),
             "build_count": L.ts_build_count(i),
             "indexed_queries": L.ts_query_count(i),

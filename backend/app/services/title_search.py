@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 from .. import db
 from ..core.engine import normalize
+from ..search.story_index import Facets
+from ..search.vocab_fuzzy import typo_budget
 from .state import LibraryState
 
 
@@ -27,6 +29,8 @@ class ClueError(ValueError):
 
 
 ALGO_BASIC = "Prefix-suffix Trie lookup (C engine): one walk of 'suffix|prefix', O(|p|+|s|)"
+ALGO_BASIC_LONG = ("Prefix-Trie and suffix-Trie id lists intersected from the newest end (C engine), "
+                   "used because a clue is longer than the {cap}-character Trie depth; no title is scanned")
 ALGO_MULTI = ("Indexed candidate intersection (C engine): prefix Trie + suffix Trie + n-gram "
               "postings, smallest list first, then verification of survivors only")
 
@@ -63,6 +67,7 @@ def basic_search(state: LibraryState, dataset: str, prefix: str, suffix: str, re
     t0 = time.perf_counter()
     with eng.lock:
         rid = eng.query(p, s)
+        path = eng.last_path()
     elapsed = _ms(t0)
     # Ambiguity report: how many records share these clues (multi-clue engine).
     with eng.lock:
@@ -75,7 +80,9 @@ def basic_search(state: LibraryState, dataset: str, prefix: str, suffix: str, re
         "record": state.record(dataset, rid) if rid >= 0 else None,
         "matching_records": total,
         "elapsed_ms": elapsed,
-        "algorithm": ALGO_BASIC,
+        "algorithm": ALGO_BASIC if path == "prefix-suffix-trie" else ALGO_BASIC_LONG.format(cap=eng.max_affix),
+        "index_path": path,
+        "search_id": None,
         "message": (
             f"Latest inserted of {total} matching record{'s' if total != 1 else ''}."
             if rid >= 0 else f"No title begins with '{p}' and ends with '{s}'."
@@ -83,8 +90,8 @@ def basic_search(state: LibraryState, dataset: str, prefix: str, suffix: str, re
     }
     if record:
         summary = f"#{rid} {out['record']['title']}" if rid >= 0 else "No match"
-        db.record_search("basic", dataset, {"prefix": prefix, "suffix": suffix}, summary,
-                         1 if rid >= 0 else 0, "success" if rid >= 0 else "no_match", elapsed)
+        out["search_id"] = db.record_search("basic", dataset, {"prefix": prefix, "suffix": suffix}, summary,
+                                            1 if rid >= 0 else 0, "success" if rid >= 0 else "no_match", elapsed)
     return out
 
 
@@ -97,7 +104,8 @@ def _clean_contains(contains: list[str]) -> list[str]:
 
 
 def multi_search(state: LibraryState, dataset: str, prefix: str, contains: list[str], suffix: str,
-                 limit: int = 500, record: bool = True, kind: str = "multi") -> dict:
+                 limit: int = 200, record: bool = True, kind: str = "multi",
+                 facets: Facets | None = None) -> dict:
     p, s = normalize(prefix), normalize(suffix)
     cs = _clean_contains(contains)
     if not p and not s and not cs:
@@ -105,12 +113,19 @@ def multi_search(state: LibraryState, dataset: str, prefix: str, contains: list[
     if len(cs) > 8:
         raise ClueError("Use at most 8 'contains' clues.", "contains")
     eng = state.engine(dataset)
+    use_facets = facets is not None and facets.active() and dataset == "library"
     t0 = time.perf_counter()
     with eng.lock:
-        res = eng.multi(p, cs, s, cap=limit)
+        res = eng.multi(p, cs, s, cap=eng.size if use_facets else limit)
+    ids = res.ids
+    total = res.total
+    if use_facets:
+        ids = [i for i in ids if facets.allows(state.books[i])]
+        total = len(ids)
+        ids = ids[:limit]
     elapsed = _ms(t0)
     results = []
-    for rid in res.ids:
+    for rid in ids:
         rec = state.record(dataset, rid)
         rec["matched_clues"] = _spans(rec["normalized_title"], p, cs, s)
         results.append(rec)
@@ -118,9 +133,12 @@ def multi_search(state: LibraryState, dataset: str, prefix: str, contains: list[
         "dataset": dataset,
         "clues": {"prefix": prefix, "contains": contains, "suffix": suffix},
         "normalized": {"prefix": p, "contains": cs, "suffix": s},
-        "status": "match" if res.total > 0 else "no_match",
-        "total": res.total,
+        "status": "match" if total > 0 else "no_match",
+        "total": total,
+        "unfiltered_total": res.total,
+        "facets_applied": use_facets,
         "results": results,
+        "search_id": None,
         "candidates_verified": res.examined,
         "catalog_size": eng.size,
         "elapsed_ms": elapsed,
@@ -128,25 +146,61 @@ def multi_search(state: LibraryState, dataset: str, prefix: str, contains: list[
     }
     if record:
         summary = (", ".join(f"#{r['id']} {r['title']}" for r in results[:3]) +
-                   (f" (+{res.total - 3} more)" if res.total > 3 else "")) if results else "No match"
-        db.record_search(kind, dataset, {"prefix": prefix, "contains": contains, "suffix": suffix},
-                         summary, res.total, "success" if res.total else "no_match", elapsed)
+                   (f" (+{total - 3} more)" if total > 3 else "")) if results else "No match"
+        out["search_id"] = db.record_search(kind, dataset, {"prefix": prefix, "contains": contains, "suffix": suffix},
+                                            summary, total, "success" if total else "no_match", elapsed)
     return out
 
 
 def live_suggestions(state: LibraryState, dataset: str, prefix: str, contains: list[str], suffix: str,
                      limit: int = 6) -> dict:
-    """As-you-type suggestions. Not written to history; never scans the catalog."""
+    """As-you-type suggestions. Not written to history; never scans the catalogue.
+
+    When nothing matches exactly, typo-tolerant *approximate* matches are
+    returned separately: the prefix/suffix clue is looked up in the prefix or
+    suffix Trie with an edit budget of 0 (1-4 letters), 1 (5-8) or 2 (9+).
+    """
     p, s = normalize(prefix), normalize(suffix)
     cs = _clean_contains(contains)
+    empty = {"dataset": dataset, "total": 0, "suggestions": [], "approximate": [], "elapsed_ms": 0.0,
+             "algorithm": ALGO_MULTI, "normalized": {"prefix": p, "contains": cs, "suffix": s}}
     if not p and not s and not cs:
-        return {"dataset": dataset, "total": 0, "suggestions": [], "elapsed_ms": 0.0,
-                "algorithm": ALGO_MULTI, "normalized": {"prefix": p, "contains": cs, "suffix": s}}
+        return empty
     out = multi_search(state, dataset, prefix, contains, suffix, limit=limit, record=False)
+    approx: list[dict] = []
+    if out["total"] == 0:
+        eng = state.engine(dataset)
+        seen: set[int] = set()
+        t0 = time.perf_counter()
+        with eng.lock:
+            for clue_type, clue in (("prefix", p), ("suffix", s)):
+                budget = typo_budget(clue.replace(" ", "")) if clue else 0
+                if not budget:
+                    continue
+                for v in eng.fuzzy(clue, clue_type == "suffix", maxdist=budget, limit=8):
+                    if len(v.text) < len(clue) - budget:
+                        continue
+                    np_, ns_ = (v.text, s) if clue_type == "prefix" else (p, v.text)
+                    r = eng.multi(np_, cs, ns_, cap=limit)
+                    for rid in r.ids:
+                        if rid in seen:
+                            continue
+                        seen.add(rid)
+                        rec = state.record(dataset, rid)
+                        rec["matched_clues"] = _spans(rec["normalized_title"], np_, cs, ns_)
+                        rec["approximation"] = {"clue": clue_type, "typed": clue, "matched": v.text,
+                                                "distance": v.distance}
+                        approx.append(rec)
+                        if len(approx) >= limit:
+                            break
+                    if len(approx) >= limit:
+                        break
+        out["elapsed_ms"] = round(out["elapsed_ms"] + _ms(t0), 4)
     return {
         "dataset": dataset,
         "total": out["total"],
         "suggestions": out["results"],
+        "approximate": approx,
         "elapsed_ms": out["elapsed_ms"],
         "candidates_verified": out["candidates_verified"],
         "algorithm": out["algorithm"],

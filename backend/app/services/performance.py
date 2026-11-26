@@ -20,9 +20,14 @@ def overview(state: LibraryState) -> dict:
     stats = db.get_search_stats()
     success = sum(s["success"] for s in stats)
     failure = sum(s["failure"] for s in stats)
+    fb = db.feedback_stats()
     return {
         "catalog_records": len(state.books),
+        "curated_records": sum(1 for b in state.books if b["source"] == "curated"),
+        "extended_records": sum(1 for b in state.books if b["source"] == "goodbooks"),
         "dsa_records": len(state.dsa_names),
+        "confirmed_found": fb["found"],
+        "confirmed_total": fb["total"],
         "indexed_records": state.library_engine.size + state.dsa_engine.size,
         "total_searches": success + failure,
         "successful_searches": success,
@@ -40,7 +45,9 @@ def performance(state: LibraryState) -> dict:
     return {
         "engines": [state.library_engine.stats(), state.dsa_engine.stats()],
         "build_times_ms": {k: round(v, 4) for k, v in state.build_times_ms.items()},
-        "story_index": {"documents": state.story.n_docs, "vocabulary": state.story.vocabulary_size},
+        "story_index": {"documents": state.story.n_docs, "vocabulary": state.story.vocabulary_size,
+                        "wordnet_aliases": len(state.story.wordnet)},
+        "feedback": db.feedback_stats(),
         "searches": by_type,
         "overview": overview(state),
     }
@@ -49,6 +56,7 @@ def performance(state: LibraryState) -> dict:
 def make_queries(titles: list[str], n: int, seed: int = 7, max_affix: int = 10) -> list[tuple[str, str]]:
     """Deterministic mix: ~70% clues taken from real titles, ~30% random misses."""
     rng = random.Random(seed)
+    titles = [t for t in titles if t] or ["a"]   # titles in other scripts normalise to ""
     qs = []
     letters = "abcdefghijklmnopqrstuvwxyz"
     for i in range(n):
@@ -89,6 +97,17 @@ def _bench_engine(eng: TitleEngine, titles: list[str], n: int) -> dict:
         midx_ns, midx_out = _best(eng.bench_multi, triples, False)
         mlin_ns, mlin_out = _best(eng.bench_multi, triples, True)
     hits = sum(1 for r in idx_out if r >= 0)
+    with eng.lock:
+        hb = eng.bench_hash(qs)
+    hash_part = None
+    if hb is not None:
+        hash_part = {
+            "build_ms": round(hb["build_ns"] / 1e6, 3),
+            "total_ms": round(hb["query_ns"] / 1e6, 4),
+            "avg_us": round(hb["query_ns"] / 1e3 / max(1, n), 4),
+            "memory_bytes": hb["bytes"],
+            "results_agree": hb["out"] == idx_out,
+        }
     return {
         "dataset": eng.name,
         "catalog_size": eng.size,
@@ -102,7 +121,9 @@ def _bench_engine(eng: TitleEngine, titles: list[str], n: int) -> dict:
             "linear_avg_us": round(lin_ns / 1e3 / max(1, n), 4),
             "speedup": round(lin_ns / idx_ns, 2) if idx_ns > 0 else None,
             "results_agree": idx_out == lin_out,
+            "trie_memory_bytes": eng.stats()["memory_bytes"],
         },
+        "hash_baseline": hash_part,
         "multi": {
             "indexed_total_ms": round(midx_ns / 1e6, 4),
             "linear_total_ms": round(mlin_ns / 1e6, 4),
@@ -122,13 +143,21 @@ def benchmark(state: LibraryState, dataset: str, n: int = MAX_QUERIES) -> dict:
     return out
 
 
-def scaling(n_queries: int = MAX_QUERIES, sizes: tuple[int, ...] = (125, 250, 500, 750, 1000)) -> dict:
-    """Build temporary indexes over growing prefixes of the DSA catalog."""
-    names = generate_dsa_names(MAX_NAMES)
+def scaling(n_queries: int = MAX_QUERIES, dataset: str = "dsa", state: LibraryState | None = None) -> dict:
+    """Build temporary indexes over growing prefixes of a catalogue and time them."""
+    if dataset == "library" and state is not None:
+        from .state import LIBRARY_MAX_AFFIX
+        titles = [b["normalized_title"] for b in state.books]
+        sizes: tuple[int, ...] = (1000, 2500, 5000, 7500, len(titles))
+        cap = LIBRARY_MAX_AFFIX
+    else:
+        titles = generate_dsa_names(MAX_NAMES)
+        sizes = (125, 250, 500, 750, 1000)
+        cap = 0
     rows = []
     for size in sizes:
-        sub = names[:size]
-        eng = TitleEngine(f"dsa-{size}", sub)
+        sub = titles[:size]
+        eng = TitleEngine(f"{dataset}-{size}", sub, max_affix=cap)
         b = _bench_engine(eng, sub, n_queries)
         st = eng.stats()
         rows.append({
@@ -136,13 +165,16 @@ def scaling(n_queries: int = MAX_QUERIES, sizes: tuple[int, ...] = (125, 250, 50
             "build_ms": round(eng.build_ms, 4),
             "trie_nodes": st["ps_trie_nodes"],
             "combinations": st["prefix_suffix_combinations"],
+            "memory_bytes": st["memory_bytes"],
+            "memory_per_1000_mb": round(st["memory_bytes"] / size * 1000 / 1e6, 3),
             "indexed_avg_us": b["exact"]["indexed_avg_us"],
             "linear_avg_us": b["exact"]["linear_avg_us"],
+            "hash_avg_us": b["hash_baseline"]["avg_us"] if b["hash_baseline"] else None,
             "speedup": b["exact"]["speedup"],
             "results_agree": b["exact"]["results_agree"],
         })
         del eng
-    return {"queries_per_size": n_queries, "rows": rows}
+    return {"dataset": dataset, "queries_per_size": n_queries, "max_affix": cap, "rows": rows}
 
 
 def self_check(state: LibraryState) -> dict:
@@ -165,14 +197,20 @@ def self_check(state: LibraryState) -> dict:
             bool(dup_ids) and r == dup_ids[-1] and dsa.multi(dup_name, [], dup_name).total >= len(dup_ids),
             f"'{dup_name}' stored at ids {dup_ids}; exact search returns latest id {r}.")
         fr = lib.multi("frankenstein", [], "frankenstein")
-        add("Duplicate book records (library)", fr.total == 2 and lib.query("frank", "stein") == fr.ids[0],
+        add("Duplicate book records (library)", fr.total >= 2 and lib.query("frank", "stein") == fr.ids[0],
             f"'Frankenstein' records {fr.ids} (newest first); exact search returns {lib.query('frank', 'stein')}.")
+        lp = lib.query("harry potter and the", "stone")
+        path = lib.last_path()
+        hp = lib.multi("harry potter and the", [], "stone")
+        add("Clues longer than the Trie depth use the indexed fallback",
+            path == "affix-intersection" and hp.total > 0 and lp == hp.ids[0],
+            f"20-character prefix > depth {lib.max_affix}: answered by {path} -> id {lp} (latest of {hp.total}).")
         # Ambiguity
         amb = lib.multi("the", [], "e", cap=50)
         latest = lib.query("the", "e")
         add("Ambiguous clues return the latest inserted match",
             amb.total >= 2 and latest == amb.ids[0],
-            f"{amb.total} titles begin with 'the' and end with 'e' (ids {amb.ids}); "
+            f"{amb.total} titles begin with 'the' and end with 'e' (newest: {amb.ids[:5]}); "
             f"exact search returns the latest, id {latest}.")
         # No match
         nm = lib.query("zzq", "qqz")
@@ -192,7 +230,9 @@ def self_check(state: LibraryState) -> dict:
             f"{len(names)} names (max {MAX_NAMES}); longest = {max(map(len, names))} (max {MAX_LEN}).")
     # Maximum query count, indexed vs linear agreement
     b = _bench_engine(dsa, names, MAX_QUERIES)
-    add("2,000 queries: indexed answers equal linear scan", b["exact"]["results_agree"] and b["multi"]["results_agree"],
+    add("2,000 queries: indexed answers equal linear scan and hash map",
+        b["exact"]["results_agree"] and b["multi"]["results_agree"] and bool(b["hash_baseline"])
+        and b["hash_baseline"]["results_agree"],
         f"{b['queries']} queries, {b['hits']} hits; indexed {b['exact']['indexed_total_ms']} ms vs "
         f"linear {b['exact']['linear_total_ms']} ms.")
     return {"passed": sum(c["passed"] for c in checks), "total": len(checks), "checks": checks}

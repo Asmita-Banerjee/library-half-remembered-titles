@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from .. import db
 from ..data.dsa_catalog import MAX_QUERIES
 from ..services import catalog, performance, title_search
+from ..search.story_index import Facets
 from ..services.state import get_state
 
 router = APIRouter(prefix="/api")
@@ -24,11 +25,23 @@ class BasicRequest(BaseModel):
     suffix: str = Clue
 
 
+class FacetFields(BaseModel):
+    genre: str = Field(default="", max_length=60)
+    audience: Literal["", "General", "Young Adult", "Children"] = ""
+    source: Literal["", "curated", "goodbooks"] = ""
+    year_from: int | None = Field(default=None, ge=-3000, le=3000)
+    year_to: int | None = Field(default=None, ge=-3000, le=3000)
+
+    def to_facets(self) -> Facets:
+        return Facets(self.genre, self.audience, self.source, self.year_from, self.year_to)
+
+
 class MultiRequest(BaseModel):
     dataset: Dataset = "library"
     prefix: str = Clue
     contains: list[str] = Field(default_factory=list, max_length=8)
     suffix: str = Clue
+    facets: FacetFields | None = None
 
 
 class LiveRequest(MultiRequest):
@@ -42,6 +55,14 @@ class AuthorRequest(BaseModel):
 class StoryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     limit: int = Field(default=10, ge=1, le=60)
+    facets: FacetFields | None = None
+
+
+class FeedbackRequest(BaseModel):
+    search_id: int | None = None
+    search_type: Literal["basic", "multi", "author", "story"]
+    found: bool
+    record_id: int | None = None
 
 
 @router.get("/health")
@@ -65,8 +86,21 @@ def list_catalog(
     author: str = Query("", max_length=120),
     year_from: int | None = None,
     year_to: int | None = None,
+    audience: Literal["", "General", "Young Adult", "Children"] = "",
+    source: Literal["", "curated", "goodbooks"] = "",
 ):
-    return catalog.list_catalog(get_state(), dataset, page, page_size, q, genre, author, year_from, year_to)
+    return catalog.list_catalog(get_state(), dataset, page, page_size, q, genre, author, year_from, year_to,
+                                audience, source)
+
+
+@router.get("/facets")
+def facets():
+    return catalog.facet_options(get_state())
+
+
+@router.get("/random")
+def random_books(n: int = Query(4, ge=1, le=12), seed: int | None = None):
+    return {"books": catalog.random_books(get_state(), n, seed)}
 
 
 @router.get("/books/{book_id}")
@@ -84,7 +118,8 @@ def search_title(req: BasicRequest):
 
 @router.post("/search/multi")
 def search_multi(req: MultiRequest):
-    return title_search.multi_search(get_state(), req.dataset, req.prefix, req.contains, req.suffix)
+    return title_search.multi_search(get_state(), req.dataset, req.prefix, req.contains, req.suffix,
+                                     facets=req.facets.to_facets() if req.facets else None)
 
 
 @router.post("/search/live")
@@ -113,7 +148,13 @@ def search_author(req: AuthorRequest):
 def search_story(req: StoryRequest):
     if not req.query.strip():
         raise HTTPException(422, "Describe a character, plot, setting or theme.")
-    return catalog.story_search(get_state(), req.query, req.limit)
+    return catalog.story_search(get_state(), req.query, req.limit,
+                                facets=req.facets.to_facets() if req.facets else None)
+
+
+@router.post("/feedback")
+def feedback(req: FeedbackRequest):
+    return db.record_feedback(req.search_id, req.search_type, req.found, req.record_id)
 
 
 @router.get("/history")
@@ -137,8 +178,8 @@ def stats_benchmark(dataset: Dataset = "dsa", queries: int = Query(MAX_QUERIES, 
 
 
 @router.get("/stats/scaling")
-def stats_scaling(queries: int = Query(MAX_QUERIES, ge=1, le=MAX_QUERIES)):
-    return performance.scaling(queries)
+def stats_scaling(queries: int = Query(MAX_QUERIES, ge=1, le=MAX_QUERIES), dataset: Dataset = "dsa"):
+    return performance.scaling(queries, dataset, get_state())
 
 
 @router.get("/stats/selfcheck")

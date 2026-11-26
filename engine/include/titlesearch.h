@@ -35,6 +35,10 @@ typedef struct TSIndex TSIndex;
 
 /* Lifecycle */
 TSIndex *ts_create(void);
+/* max_affix > 0 limits the prefix-suffix trie to prefixes and suffixes of at
+ * most that many characters (bounds memory for large catalogues). Longer
+ * clues are answered by intersecting the prefix- and suffix-trie id lists. */
+TSIndex *ts_create_ex(int max_affix);
 void     ts_destroy(TSIndex *idx);
 int      ts_add(TSIndex *idx, const char *title);   /* returns new id or error */
 int      ts_build(TSIndex *idx);                    /* 0 ok, TS_BUILT if repeated */
@@ -42,12 +46,19 @@ int      ts_is_built(const TSIndex *idx);
 int      ts_size(const TSIndex *idx);
 const char *ts_title(const TSIndex *idx, int id);   /* normalised title or NULL */
 
-/* Lowercase; keep a-z 0-9 ' -; collapse whitespace/punctuation runs to one
- * space; trim. Returns resulting length (truncated to cap-1). */
+/* UTF-8 in. Folds Latin accents to ASCII (é->e, ß->ss, œ->oe), curly
+ * apostrophes to ', lowercases, keeps a-z 0-9 ' -, collapses whitespace,
+ * dashes and punctuation runs to one space, trims, and drops anything else
+ * (other scripts). Returns resulting length (truncated to cap-1). A title
+ * that normalises to "" is still stored (its id is kept) but not indexed. */
 int ts_normalize(const char *in, char *out, int cap);
 
 /* Exact latest-match query (indexed). Both clues must be non-empty. */
 int ts_query(TSIndex *idx, const char *prefix, const char *suffix);
+/* Which structure answered the last ts_query: 0 = prefix-suffix trie,
+ * 1 = prefix/suffix-trie intersection (clue longer than max_affix). */
+int ts_last_path(const TSIndex *idx);
+int ts_max_affix(const TSIndex *idx);
 /* Same answer by scanning every title from newest to oldest (baseline). */
 int ts_query_linear(TSIndex *idx, const char *prefix, const char *suffix);
 
@@ -86,6 +97,12 @@ double ts_bench_exact(TSIndex *idx, const char *const *prefixes, const char *con
                       int n, int linear, int *out);
 double ts_bench_multi(TSIndex *idx, const char *const *prefixes, const char *const *contains,
                       const char *const *suffixes, int n, int linear, int *out);
+
+/* Hash-map baseline (all (prefix, suffix) pairs -> latest id), built on
+ * demand and freed after the run; only for indexes created without a cap.
+ * Returns query nanoseconds; build time and bytes via out-params. */
+double ts_bench_hash(TSIndex *idx, const char *const *prefixes, const char *const *suffixes, int n, int *out,
+                     double *build_ns, long *bytes);
 
 /* Statistics */
 long ts_ps_nodes(const TSIndex *idx);        /* nodes in prefix-suffix trie   */

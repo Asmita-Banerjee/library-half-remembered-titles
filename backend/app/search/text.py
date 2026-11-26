@@ -42,7 +42,34 @@ RELATED_TERMS: dict[str, tuple[str, ...]] = {
     "dystopia": ("dystopian", "totalitarianism", "surveillance"),
     "kid": ("boy", "child"),
     "girl": ("daughter", "sister"),
+    "bloodsucker": ("vampire",),
+    "vampyre": ("vampire",),
+    "corpse": ("dead", "bodies"),
+    "corpses": ("dead", "bodies"),
+    "closet": ("wardrobe",),
+    "spaceship": ("space",),
+    "teenager": ("teen", "young"),
+    "wizards": ("magic", "wizard"),
 }
+
+
+_WORDNET: dict[str, list[str]] | None = None
+
+
+def wordnet_aliases() -> dict[str, list[str]]:
+    """Precomputed WordNet table: stemmed alias -> stemmed catalogue terms."""
+    global _WORDNET
+    if _WORDNET is None:
+        import gzip
+        import json
+        from pathlib import Path
+        path = Path(__file__).resolve().parents[1] / "data" / "wordnet_related.json.gz"
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                _WORDNET = json.load(f)["aliases"]
+        except FileNotFoundError:
+            _WORDNET = {}
+    return _WORDNET
 
 
 def fold(text: str) -> str:
