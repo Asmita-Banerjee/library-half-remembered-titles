@@ -9,7 +9,6 @@ const NAV = [
   { to: "/authors", label: "Authors" },
   { to: "/catalogue", label: "Catalogue" },
   { to: "/history", label: "Your requests" },
-  { to: "/lab", label: "Under the hood" },
 ];
 
 function Brand() {

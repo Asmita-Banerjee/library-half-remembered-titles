@@ -38,7 +38,6 @@ The core data-structures work is a **search engine written in C**: a prefix-suff
 | **Catalogue** | All 10,060 records (or the 1,000 DSA test names) in insertion order, with record numbers, duplicate-title flags, pagination and filters. |
 | **Your requests** | The last five searches, stored by the server, with type, clues, result, status and whether you confirmed the find. You can repeat a search or clear the list. |
 | **"Did this find your book?"** | Every search can be confirmed or rejected. Confirmed finds give an honest success rate on the home page and in the stats. |
-| **Under the hood** | Index sizes, build times and memory, plus measured **Trie vs hash-map vs linear-scan** benchmarks and a scaling chart for each catalogue. Also 9 live scenario checks and search statistics per type. |
 
 Every control calls a real API endpoint. There are no hardcoded results.
 
@@ -277,11 +276,11 @@ CLI sample: OK
 tsc -b: no errors
 ```
 
-The "Under the hood" page also runs **9 live scenario checks** against the running indexes: duplicates, ambiguity, the long-clue fallback, no match, empty input, repeated queries, maximum catalog size, and 2,000-query agreement with the linear scan and the hash map.
+The backend also exposes (at `/api/stats/*`) a self-check that runs **9 live scenario checks** against the running indexes: duplicates, ambiguity, the long-clue fallback, no match, empty input, repeated queries, maximum catalog size, and 2,000-query agreement with the linear scan and the hash map.
 
 ### Benchmark results
 
-Typical figures from this machine: 2,000 queries, timed inside C, best of 5 runs. Re-run them on the "Under the hood" page.
+Typical figures from this machine: 2,000 queries, timed inside C, best of 5 runs. Re-run them via the `/api/stats/benchmark` endpoint.
 
 | Catalogue | Trie | Hash map of all pairs | Linear scan |
 |---|---|---|---|

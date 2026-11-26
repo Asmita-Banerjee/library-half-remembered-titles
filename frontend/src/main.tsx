@@ -1,4 +1,4 @@
-import { StrictMode, Suspense, lazy } from "react";
+import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import Layout from "./components/Layout";
@@ -11,7 +11,6 @@ import HomePage from "./pages/Home";
 import StoryPage from "./pages/Story";
 import TitleSearchPage from "./pages/TitleSearch";
 
-const PerformancePage = lazy(() => import("./pages/Performance"));
 
 function NotFound() {
   return (
@@ -34,10 +33,8 @@ createRoot(document.getElementById("root")!).render(
           <Route path="catalogue" element={<CatalogPage />} />
           <Route path="book/:id" element={<BookPage />} />
           <Route path="history" element={<HistoryPage />} />
-          <Route path="lab" element={<Suspense fallback={<p className="text-sage">Loading…</p>}><PerformancePage /></Suspense>} />
           <Route path="story" element={<Navigate to="/plot" replace />} />
           <Route path="catalog" element={<Navigate to="/catalogue" replace />} />
-          <Route path="performance" element={<Navigate to="/lab" replace />} />
           <Route path="*" element={<NotFound />} />
         </Route>
       </Routes>
